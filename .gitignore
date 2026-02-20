@@ -1,0 +1,16 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.Python
+
+# Secrets
+.env
+
+# Session data (stored globally at ~/.video-analyzer/, not in repo)
+output/
+
+# Editor
+.vscode/
+.idea/
