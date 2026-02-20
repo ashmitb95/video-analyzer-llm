@@ -43,14 +43,15 @@ from mcp.server.fastmcp import FastMCP
 from analyzer import describe_frames
 from config import (
     CLAUDE_MODEL,
+    FRAME_SELECTION_MAX,
+    FRAME_SELECTION_MIN_INTERVAL,
+    FRAME_SELECTION_MODEL,
     IMAGE_MAX_WIDTH,
     MAX_FRAMES_PER_BATCH,
-    MIN_FRAME_INTERVAL,
-    SCENE_THRESHOLD,
     TRANSCRIPT_WINDOW,
 )
 from downloader import download_video, fetch_transcript
-from extractor import extract_frames as _extract_frames
+from frame_extractor import extract_frames_at_timestamps
 from session import (
     frames_dir as session_frames_dir,
     list_sessions as _list_sessions,
@@ -116,12 +117,20 @@ def extract_video(url: str) -> str:
     video_path, _ = download_video(url, s_dir)
     transcript = fetch_transcript(video_id, s_dir)
 
-    # Extract frames
-    frames = _extract_frames(
+    # Analyze transcript for key visual moments
+    from transcript_selector import select_frames_from_transcript
+    selections = select_frames_from_transcript(
+        transcript=transcript,
+        model=FRAME_SELECTION_MODEL,
+        max_frames=FRAME_SELECTION_MAX,
+        min_interval=FRAME_SELECTION_MIN_INTERVAL,
+    )
+
+    # Extract targeted frames
+    frames = extract_frames_at_timestamps(
         video_path=video_path,
         frames_dir=f_dir,
-        threshold=SCENE_THRESHOLD,
-        min_interval=MIN_FRAME_INTERVAL,
+        selections=selections,
         max_width=IMAGE_MAX_WIDTH,
     )
 

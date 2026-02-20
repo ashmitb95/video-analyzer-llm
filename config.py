@@ -23,3 +23,13 @@ MAX_FRAMES_PER_BATCH = 8
 # Resize frames to this width (px) before sending to the API.
 # Reduces token cost without losing chart readability.
 IMAGE_MAX_WIDTH = 1280
+
+# ── Transcript-driven frame selection ──────────────────────────────────────────
+# Cheap text-only model to analyze transcript and pick visually important moments.
+FRAME_SELECTION_MODEL = "claude-haiku-4-5-20251001"
+
+# Maximum frames to select from transcript analysis.
+FRAME_SELECTION_MAX = 25
+
+# Minimum seconds between two transcript-selected frames.
+FRAME_SELECTION_MIN_INTERVAL = 5.0

@@ -23,12 +23,18 @@ import re
 import sys
 from pathlib import Path
 
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).parent / ".env")
+
 import yt_dlp
 
 from analyzer import describe_frames
 from asker import ask as ask_session
 from config import (
     CLAUDE_MODEL,
+    FRAME_SELECTION_MAX,
+    FRAME_SELECTION_MIN_INTERVAL,
+    FRAME_SELECTION_MODEL,
     IMAGE_MAX_WIDTH,
     MAX_FRAMES_PER_BATCH,
     MIN_FRAME_INTERVAL,
@@ -38,7 +44,7 @@ from config import (
 )
 from context import load_context
 from downloader import download_video, fetch_transcript
-from extractor import extract_frames
+from frame_extractor import extract_frames, extract_frames_at_timestamps
 from session import (
     frames_dir as session_frames_dir,
     list_sessions,
@@ -47,6 +53,7 @@ from session import (
     session_dir,
     session_exists,
 )
+from transcript_selector import select_frames_from_transcript
 
 
 def extract_video_id(url: str) -> str:
@@ -79,46 +86,119 @@ def cmd_extract(args):
     video_id = extract_video_id(args.url)
     s_dir = session_dir(video_id)
     f_dir = session_frames_dir(video_id)
+    progress_file = s_dir / "descriptions_progress.jsonl"
+    use_transcript_select = not args.no_transcript_select
+
+    steps = "4" if use_transcript_select else "3"
 
     print(f"\n{'=' * 44}")
     print(f"  video-analyzer extract")
     print(f"  Video ID : {video_id}")
     print(f"  Session  : {s_dir}")
+    if use_transcript_select:
+        print(f"  Mode     : transcript-driven ({args.max_frames} max frames)")
+    else:
+        print(f"  Mode     : scene-detection (legacy)")
+    if args.resume:
+        print(f"  Resume   : yes")
     print(f"{'=' * 44}\n")
 
-    if session_exists(video_id) and not args.force:
+    if session_exists(video_id) and not args.force and not args.resume:
         print(f"Session already exists. Use --force to re-extract.")
         print(f"Run: python main.py ask {video_id} \"your question\"")
         return
 
-    # 1 — Download
-    print("[1/3] Downloading video and transcript...")
-    title = get_video_title(args.url)
-    video_path, _ = download_video(args.url, s_dir)
-    transcript = fetch_transcript(video_id, s_dir)
+    if args.resume:
+        # ── Resume: load existing frames + transcript from disk ──
+        frames_json = f_dir / "frames.json"
+        transcript_json = s_dir / "transcript.json"
 
-    # 2 — Extract frames
-    print("\n[2/3] Extracting key frames...")
-    frames = extract_frames(
-        video_path=video_path,
-        frames_dir=f_dir,
-        threshold=args.threshold,
-        min_interval=args.interval,
-        max_width=IMAGE_MAX_WIDTH,
-    )
+        if not frames_json.exists() or not transcript_json.exists():
+            print("ERROR: Cannot resume — frames.json or transcript.json not found.")
+            print("Run without --resume first to complete steps 1-3.")
+            sys.exit(1)
+
+        print(f"[1/{steps}] Downloading video and transcript... SKIPPED (resume)")
+        title = get_video_title(args.url)
+        transcript = json.loads(transcript_json.read_text())
+        print(f"  Loaded transcript: {len(transcript)} segments")
+
+        if use_transcript_select:
+            print(f"\n[2/{steps}] Analyzing transcript... SKIPPED (resume)")
+
+        step_frames = "3" if use_transcript_select else "2"
+        print(f"\n[{step_frames}/{steps}] Extracting key frames... SKIPPED (resume)")
+        frames = json.loads(frames_json.read_text())
+        print(f"  Loaded frames: {len(frames)} from {frames_json}")
+
+        # Load any partial description progress
+        existing_descriptions = []
+        if progress_file.exists():
+            for line in progress_file.read_text().splitlines():
+                if line.strip():
+                    existing_descriptions.append(json.loads(line))
+            if existing_descriptions:
+                print(f"  Resuming descriptions: {len(existing_descriptions)} batches already done")
+    else:
+        # ── Fresh run ──
+        # 1 — Download
+        print(f"[1/{steps}] Downloading video and transcript...")
+        title = get_video_title(args.url)
+        video_path, _ = download_video(args.url, s_dir)
+        transcript = fetch_transcript(video_id, s_dir)
+
+        if use_transcript_select:
+            # 2 — Analyze transcript for key visual moments
+            print(f"\n[2/{steps}] Analyzing transcript for key visual moments...")
+            selections = select_frames_from_transcript(
+                transcript=transcript,
+                model=FRAME_SELECTION_MODEL,
+                max_frames=args.max_frames,
+                min_interval=FRAME_SELECTION_MIN_INTERVAL,
+            )
+            print(f"  Identified {len(selections)} key moments from transcript")
+            for i, sel in enumerate(selections, 1):
+                print(f"    {i:2d}. {sel['timestamp']:.1f}s — {sel['reason']}")
+
+            # 3 — Extract targeted frames
+            print(f"\n[3/{steps}] Extracting {len(selections)} targeted frames...")
+            frames = extract_frames_at_timestamps(
+                video_path=video_path,
+                frames_dir=f_dir,
+                selections=selections,
+                max_width=IMAGE_MAX_WIDTH,
+            )
+        else:
+            # Legacy: scene detection + fallback
+            print(f"\n[2/{steps}] Extracting key frames (scene detection)...")
+            frames = extract_frames(
+                video_path=video_path,
+                frames_dir=f_dir,
+                threshold=args.threshold,
+                min_interval=args.interval,
+                max_width=IMAGE_MAX_WIDTH,
+            )
+
+        existing_descriptions = []
+        # Clear any stale progress file from a previous failed run
+        if progress_file.exists():
+            progress_file.unlink()
 
     if not frames:
-        print("ERROR: No frames extracted. Try --threshold 0.05")
+        print("ERROR: No frames extracted.")
         sys.exit(1)
 
-    # 3 — Describe frames (Pass 1)
-    print(f"\n[3/3] Describing {len(frames)} frames with {CLAUDE_MODEL}...")
+    # Final step — Describe frames
+    step_describe = steps
+    print(f"\n[{step_describe}/{steps}] Describing {len(frames)} frames with {CLAUDE_MODEL}...")
     descriptions = describe_frames(
         frames=frames,
         transcript=transcript,
         model=CLAUDE_MODEL,
         transcript_window=TRANSCRIPT_WINDOW,
         batch_size=MAX_FRAMES_PER_BATCH,
+        progress_file=progress_file,
+        existing_descriptions=existing_descriptions,
     )
 
     # Get video duration from frames metadata
@@ -134,6 +214,10 @@ def cmd_extract(args):
         frame_descriptions=descriptions,
         frames=frames,
     )
+
+    # Clean up progress file on success
+    if progress_file.exists():
+        progress_file.unlink()
 
     print(f"\n{'=' * 44}")
     print(f"  DONE — session saved")
@@ -212,8 +296,14 @@ def main():
                            help=f"Scene change sensitivity 0–1 (default {SCENE_THRESHOLD})")
     p_extract.add_argument("--interval", type=float, default=MIN_FRAME_INTERVAL,
                            help=f"Min seconds between frames (default {MIN_FRAME_INTERVAL})")
+    p_extract.add_argument("--max-frames", type=int, default=FRAME_SELECTION_MAX,
+                           help=f"Max frames from transcript analysis (default {FRAME_SELECTION_MAX})")
+    p_extract.add_argument("--no-transcript-select", action="store_true",
+                           help="Skip transcript analysis — use legacy scene detection")
     p_extract.add_argument("--force", action="store_true",
                            help="Re-extract even if session already exists")
+    p_extract.add_argument("--resume", action="store_true",
+                           help="Resume from last step — skip completed steps")
 
     # ask
     p_ask = sub.add_parser("ask", help="Ask a question about a processed video")

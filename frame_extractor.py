@@ -111,6 +111,37 @@ def build_fallback_timestamps(duration: float, existing: list[float], interval: 
     return extra
 
 
+def extract_frames_at_timestamps(
+    video_path: Path,
+    frames_dir: Path,
+    selections: list[dict],
+    max_width: int,
+) -> list[dict]:
+    """
+    Extract frames at specific pre-selected timestamps.
+    `selections` is a list of {"timestamp": float, "reason": str}.
+    Returns list of dicts: [{'timestamp': float, 'path': str, 'reason': str}, ...]
+    Also writes frames/frames.json.
+    """
+    frames_dir.mkdir(parents=True, exist_ok=True)
+
+    frames = []
+    for i, sel in enumerate(selections):
+        ts = sel["timestamp"]
+        reason = sel.get("reason", "")
+        output_path = frames_dir / f"frame_{i:04d}_{ts:.2f}s.png"
+        ok = extract_frame(video_path, ts, output_path, max_width)
+        if ok:
+            frames.append({"timestamp": ts, "path": str(output_path), "reason": reason})
+            print(f"  [{i + 1}/{len(selections)}] {ts:.1f}s → {output_path.name}")
+        else:
+            print(f"  [{i + 1}/{len(selections)}] {ts:.1f}s → FAILED (skipped)")
+
+    (frames_dir / "frames.json").write_text(json.dumps(frames, indent=2))
+    print(f"  Frame metadata saved to {frames_dir / 'frames.json'}")
+    return frames
+
+
 def extract_frames(
     video_path: Path,
     frames_dir: Path,

@@ -7,8 +7,19 @@ later via `ask`.
 """
 
 import base64
+import time
 
 import anthropic
+
+MAX_RETRIES = 5
+INITIAL_BACKOFF = 2.0  # seconds
+
+# Transient errors worth retrying
+_RETRYABLE = (
+    anthropic.APIConnectionError,
+    anthropic.RateLimitError,
+    anthropic.InternalServerError,
+)
 
 
 def get_transcript_context(transcript: list[dict], timestamp: float, window: float) -> str:
@@ -25,25 +36,51 @@ def encode_image(path: str) -> str:
         return base64.standard_b64encode(f.read()).decode("utf-8")
 
 
+def _call_with_retry(client, **kwargs) -> anthropic.types.Message:
+    """Call client.messages.create with exponential backoff on transient errors."""
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            return client.messages.create(**kwargs)
+        except _RETRYABLE as e:
+            if attempt == MAX_RETRIES:
+                raise
+            delay = INITIAL_BACKOFF * (2 ** (attempt - 1))
+            print(f"    ⏳ {type(e).__name__} — retrying in {delay:.0f}s (attempt {attempt}/{MAX_RETRIES})")
+            time.sleep(delay)
+
+
 def describe_frames(
     frames: list[dict],
     transcript: list[dict],
     model: str,
     transcript_window: float,
     batch_size: int,
+    progress_file=None,
+    existing_descriptions: list[str] | None = None,
 ) -> list[str]:
     """
     For each batch of frames, ask Claude to describe what's on screen
     and what concept the instructor is explaining.
     Returns a list of description strings (one per batch).
-    """
-    client = anthropic.Anthropic()
-    descriptions = []
 
-    for batch_start in range(0, len(frames), batch_size):
+    If `existing_descriptions` is provided, skips that many batches (resume).
+    If `progress_file` is a Path, appends each new description as a JSON line.
+    """
+    import json
+
+    client = anthropic.Anthropic()
+    descriptions = list(existing_descriptions or [])
+    skip_batches = len(descriptions)
+
+    total_batches = (len(frames) + batch_size - 1) // batch_size
+
+    for batch_idx, batch_start in enumerate(range(0, len(frames), batch_size)):
+        if batch_idx < skip_batches:
+            continue
+
         batch = frames[batch_start : batch_start + batch_size]
         batch_end = min(batch_start + batch_size, len(frames))
-        print(f"  Describing frames {batch_start + 1}–{batch_end} of {len(frames)}...")
+        print(f"  Describing frames {batch_start + 1}–{batch_end} of {len(frames)} (batch {batch_idx + 1}/{total_batches})...")
 
         content = []
 
@@ -51,10 +88,13 @@ def describe_frames(
             ts = frame["timestamp"]
             ctx = get_transcript_context(transcript, ts, transcript_window)
 
+            reason = frame.get("reason", "")
+            reason_line = f"Selected because: \"{reason}\"\n" if reason else ""
             content.append({
                 "type": "text",
                 "text": (
                     f"\n--- Frame at {ts:.1f}s ---\n"
+                    f"{reason_line}"
                     f"Transcript around this moment: \"{ctx}\"\n"
                     f"Screen at {ts:.1f}s:"
                 ),
@@ -81,7 +121,8 @@ def describe_frames(
             ),
         })
 
-        response = client.messages.create(
+        response = _call_with_retry(
+            client,
             model=model,
             max_tokens=2000,
             system=(
@@ -92,6 +133,12 @@ def describe_frames(
             messages=[{"role": "user", "content": content}],
         )
 
-        descriptions.append(response.content[0].text)
+        text = response.content[0].text
+        descriptions.append(text)
+
+        # Save progress after each batch
+        if progress_file:
+            with open(progress_file, "a") as f:
+                f.write(json.dumps(text) + "\n")
 
     return descriptions
