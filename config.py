@@ -33,3 +33,10 @@ FRAME_SELECTION_MAX = 25
 
 # Minimum seconds between two transcript-selected frames.
 FRAME_SELECTION_MIN_INTERVAL = 5.0
+
+# ── Slide extraction ──────────────────────────────────────────────────────────
+# Maximum slides to select from transcript analysis.
+SLIDE_SELECTION_MAX = 15
+
+# Minimum seconds between two selected slides.
+SLIDE_SELECTION_MIN_INTERVAL = 10.0

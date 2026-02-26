@@ -28,6 +28,10 @@ def frames_dir(video_id: str) -> Path:
     return session_dir(video_id) / "frames"
 
 
+def slides_dir(video_id: str) -> Path:
+    return session_dir(video_id) / "slides"
+
+
 def save_session(
     video_id: str,
     url: str,

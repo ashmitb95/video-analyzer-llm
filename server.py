@@ -1,9 +1,11 @@
 """
 video-analyzer MCP server.
 
-Exposes 3 tools to any MCP client (Claude Code, Claude Desktop, etc.):
-  extract_video(url)         — process a video, save a session
-  get_session(session_id)    — return session data (descriptions + transcript)
+Exposes tools to any MCP client (Claude Code, Claude Desktop, etc.):
+  extract_transcript(url)    — fast: fetch transcript only (no API cost)
+  extract_video(url)         — full: download video, extract frames, describe with Vision
+  extract_slides(url)        — extract presentation-quality slide frames
+  get_session(session_id)    — return session data with analysis source metadata
   list_sessions()            — list all processed videos
 
 Claude Code usage:
@@ -48,6 +50,8 @@ from config import (
     FRAME_SELECTION_MODEL,
     IMAGE_MAX_WIDTH,
     MAX_FRAMES_PER_BATCH,
+    SLIDE_SELECTION_MAX,
+    SLIDE_SELECTION_MIN_INTERVAL,
     TRANSCRIPT_WINDOW,
 )
 from downloader import download_video, fetch_transcript
@@ -59,6 +63,7 @@ from session import (
     save_session,
     session_dir,
     session_exists,
+    slides_dir as session_slides_dir,
 )
 
 import re
@@ -79,14 +84,88 @@ def _extract_video_id(url: str) -> str:
     raise ValueError(f"Cannot extract video ID from: {url}")
 
 
+def _get_title(url: str) -> str:
+    """Fetch video title without downloading."""
+    try:
+        import yt_dlp
+        with yt_dlp.YoutubeDL({"quiet": True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+            return info.get("title", "Unknown")
+    except Exception:
+        return "Unknown"
+
+
+@mcp.tool()
+def extract_transcript(url: str) -> str:
+    """
+    Fetch the transcript of a YouTube video. Fast and free — no video
+    download, no frame analysis, no API credits used.
+
+    Use this by default when a user shares a YouTube URL and wants to
+    discuss, summarize, or ask questions about its content. For most
+    videos the transcript alone is sufficient.
+
+    Only use extract_video instead if the user specifically needs
+    visual/frame analysis (e.g. "what's shown on screen", charts,
+    diagrams, code on screen).
+
+    Returns: session_id to use with get_session.
+    """
+    video_id = _extract_video_id(url)
+
+    if session_exists(video_id):
+        session = load_session(video_id)
+        return json.dumps({
+            "status": "already_extracted",
+            "session_id": video_id,
+            "title": session.get("title", "Unknown"),
+            "frame_count": session.get("frame_count", 0),
+            "message": f"Session already exists. Use get_session('{video_id}') to access it.",
+        })
+
+    s_dir = session_dir(video_id)
+    title = _get_title(url)
+
+    s_dir.mkdir(parents=True, exist_ok=True)
+    transcript = fetch_transcript(video_id, s_dir)
+
+    duration = 0.0
+    if transcript:
+        last = transcript[-1]
+        duration = last["start"] + last["duration"]
+
+    save_session(
+        video_id=video_id,
+        url=url,
+        title=title,
+        duration=duration,
+        transcript=transcript,
+        frame_descriptions=[],
+        frames=[],
+    )
+
+    return json.dumps({
+        "status": "success",
+        "session_id": video_id,
+        "title": title,
+        "frame_count": 0,
+        "duration_seconds": duration,
+        "mode": "transcript_only",
+        "transcript_segments": len(transcript),
+        "message": f"Transcript-only session ready. Call get_session('{video_id}') to access the content.",
+    })
+
+
 @mcp.tool()
 def extract_video(url: str) -> str:
     """
-    Process a YouTube video: download it, extract key frames, generate
-    visual descriptions using Claude Vision, and save a session.
+    Full visual processing of a YouTube video: downloads the video,
+    extracts key frames, and generates visual descriptions using
+    Claude Vision. Slow (~2 min) and uses API credits.
 
-    This runs once per video (~2 minutes). Subsequent calls with the
-    same URL return immediately (session already exists).
+    Only use this when the user specifically needs visual analysis
+    (e.g. charts, diagrams, code shown on screen, UI elements).
+    For most questions about a video, extract_transcript is sufficient.
 
     Returns: session_id to use with get_session.
     """
@@ -104,17 +183,9 @@ def extract_video(url: str) -> str:
 
     s_dir = session_dir(video_id)
     f_dir = session_frames_dir(video_id)
+    title = _get_title(url)
 
-    # Download
-    try:
-        import yt_dlp
-        with yt_dlp.YoutubeDL({"quiet": True}) as ydl:
-            info = ydl.extract_info(url, download=False)
-            title = info.get("title", "Unknown")
-    except Exception:
-        title = "Unknown"
-
-    video_path, _ = download_video(url, s_dir)
+    video_path, _, chapters = download_video(url, s_dir)
     transcript = fetch_transcript(video_id, s_dir)
 
     # Analyze transcript for key visual moments
@@ -124,6 +195,7 @@ def extract_video(url: str) -> str:
         model=FRAME_SELECTION_MODEL,
         max_frames=FRAME_SELECTION_MAX,
         min_interval=FRAME_SELECTION_MIN_INTERVAL,
+        chapters=chapters,
     )
 
     # Extract targeted frames
@@ -169,27 +241,178 @@ def extract_video(url: str) -> str:
 
 
 @mcp.tool()
+def extract_slides(url: str) -> str:
+    """
+    Extract presentation-quality slides from a YouTube video.
+
+    Analyzes the transcript to find moments where complete diagrams,
+    charts, code, or summaries are shown on screen, then extracts
+    those frames as PNG images. Faster and cheaper than extract_video
+    — only uses a cheap text model for selection, no Vision API.
+
+    Use this when the user needs visual aids, key screenshots, or
+    a slide deck from a video.
+
+    Returns: slide paths, timestamps, and descriptions.
+    """
+    video_id = _extract_video_id(url)
+    s_dir = session_dir(video_id)
+    sl_dir = session_slides_dir(video_id)
+
+    # Cache check: return existing slides if already extracted
+    slides_meta = sl_dir / "frames.json"
+    if slides_meta.exists():
+        cached_slides = json.loads(slides_meta.read_text())
+        if cached_slides:
+            return json.dumps({
+                "status": "cached",
+                "session_id": video_id,
+                "slide_count": len(cached_slides),
+                "slides": [
+                    {
+                        "index": i + 1,
+                        "timestamp": s["timestamp"],
+                        "path": s["path"],
+                        "reason": s.get("reason", ""),
+                    }
+                    for i, s in enumerate(cached_slides)
+                ],
+                "message": f"Slides already extracted. {len(cached_slides)} slides available.",
+            })
+
+    # Ensure video is downloaded
+    video_path = None
+    if s_dir.exists():
+        candidates = [f for f in s_dir.iterdir()
+                      if f.suffix in ('.mp4', '.mkv', '.webm') and f.stem != 'thumbnail']
+        if candidates:
+            video_path = candidates[0]
+
+    if video_path is None:
+        video_path, _, chapters = download_video(url, s_dir)
+    else:
+        chapters_file = s_dir / "chapters.json"
+        chapters = json.loads(chapters_file.read_text()) if chapters_file.exists() else []
+
+    # Ensure transcript is available
+    transcript_file = s_dir / "transcript.json"
+    if transcript_file.exists():
+        transcript = json.loads(transcript_file.read_text())
+    else:
+        transcript = fetch_transcript(video_id, s_dir)
+
+    if not transcript:
+        return json.dumps({
+            "status": "error",
+            "message": "No transcript available for this video. Cannot select slides.",
+        })
+
+    # Select slide-worthy moments
+    from transcript_selector import select_slides_from_transcript
+    selections = select_slides_from_transcript(
+        transcript=transcript,
+        model=FRAME_SELECTION_MODEL,
+        max_slides=SLIDE_SELECTION_MAX,
+        min_interval=SLIDE_SELECTION_MIN_INTERVAL,
+        chapters=chapters,
+    )
+
+    if not selections:
+        return json.dumps({
+            "status": "error",
+            "message": "Could not identify any slide-worthy moments from transcript.",
+        })
+
+    # Extract frames into slides/ directory
+    slides = extract_frames_at_timestamps(
+        video_path=video_path,
+        frames_dir=sl_dir,
+        selections=selections,
+        max_width=IMAGE_MAX_WIDTH,
+    )
+
+    if not slides:
+        return json.dumps({"status": "error", "message": "No slide frames extracted."})
+
+    # Ensure a basic session exists (for list_sessions / get_session)
+    if not session_exists(video_id):
+        title = _get_title(url)
+        duration = 0.0
+        if transcript:
+            last = transcript[-1]
+            duration = last["start"] + last.get("duration", 0)
+        save_session(
+            video_id=video_id,
+            url=url,
+            title=title,
+            duration=duration,
+            transcript=transcript,
+            frame_descriptions=[],
+            frames=[],
+        )
+
+    return json.dumps({
+        "status": "success",
+        "session_id": video_id,
+        "slide_count": len(slides),
+        "slides": [
+            {
+                "index": i + 1,
+                "timestamp": s["timestamp"],
+                "path": s["path"],
+                "reason": s.get("reason", ""),
+            }
+            for i, s in enumerate(slides)
+        ],
+        "message": f"Extracted {len(slides)} slides. Paths point to PNG files on disk.",
+    })
+
+
+@mcp.tool()
 def get_session(session_id: str) -> str:
     """
     Return the full processed content of a video session:
-    frame-by-frame visual descriptions and transcript.
+    transcript and (if available) frame-by-frame visual descriptions.
+
+    The response includes an 'analysis_source' field that tells you
+    exactly what data is available. ALWAYS mention the source when
+    answering questions — e.g. "Based on the transcript..." or
+    "Based on transcript + visual analysis of N frames...".
 
     Use the returned content to answer questions about the video.
     You (Claude) provide any codebase/project context from the
     current conversation — no need to pass it here.
 
     Args:
-        session_id: The video ID returned by extract_video or list_sessions.
+        session_id: The video ID returned by extract_transcript, extract_video, or list_sessions.
     """
     try:
         session = load_session(session_id)
     except FileNotFoundError:
         return json.dumps({
             "error": f"No session found for '{session_id}'.",
-            "hint": "Run extract_video(url) first.",
+            "hint": "Run extract_transcript(url) or extract_video(url) first.",
         })
 
     full_transcript = " ".join(seg["text"] for seg in session["transcript"])
+    frame_descriptions = session.get("frame_descriptions", [])
+    frames = session.get("frames", [])
+
+    # Build analysis source metadata
+    if frame_descriptions:
+        analysis_source = {
+            "type": "transcript + video analysis",
+            "frames_analyzed": len(frames),
+            "frame_timestamps": [
+                {"timestamp": f["timestamp"], "reason": f.get("reason", "")}
+                for f in frames
+            ],
+        }
+    else:
+        analysis_source = {
+            "type": "transcript only",
+            "note": "No visual/frame analysis was performed. Answers are based solely on the transcript.",
+        }
 
     return json.dumps({
         "video_id": session["video_id"],
@@ -198,8 +421,9 @@ def get_session(session_id: str) -> str:
         "duration_seconds": session.get("duration", 0),
         "frame_count": session.get("frame_count", 0),
         "extracted_at": session.get("extracted_at", ""),
-        "frame_descriptions": session["frame_descriptions"],
-        "transcript": full_transcript[:15000],  # first 15k chars
+        "analysis_source": analysis_source,
+        "frame_descriptions": frame_descriptions,
+        "transcript": full_transcript[:15000],
     })
 
 

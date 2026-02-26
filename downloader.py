@@ -7,7 +7,7 @@ from youtube_transcript_api import YouTubeTranscriptApi
 _ytt = YouTubeTranscriptApi()
 
 
-def download_video(url: str, output_dir: Path) -> tuple[Path, str]:
+def download_video(url: str, output_dir: Path) -> tuple[Path, str, list[dict]]:
     """Download video to output_dir. Returns (video_path, video_id)."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -26,8 +26,15 @@ def download_video(url: str, output_dir: Path) -> tuple[Path, str]:
     candidates = list(output_dir.glob(f"{video_id}.*"))
     video_path = candidates[0] if candidates else output_dir / f"{video_id}.mp4"
 
+    # Save chapter metadata if available
+    chapters = info.get("chapters") or []
+    if chapters:
+        chapters_path = output_dir / "chapters.json"
+        chapters_path.write_text(json.dumps(chapters, indent=2))
+        print(f"  Chapters saved: {len(chapters)} chapters → {chapters_path}")
+
     print(f"  Video saved: {video_path}")
-    return video_path, video_id
+    return video_path, video_id, chapters
 
 
 def fetch_transcript(video_id: str, output_dir: Path) -> list[dict]:

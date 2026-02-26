@@ -28,27 +28,32 @@ def ask(
     client = anthropic.Anthropic()
 
     full_transcript = " ".join(seg["text"] for seg in session["transcript"])
-    all_descriptions = "\n\n".join(
-        f"=== Batch {i + 1} ===\n{d}"
-        for i, d in enumerate(session["frame_descriptions"])
-    )
+    frame_descriptions = session.get("frame_descriptions", [])
 
     # Build the prompt — context is optional, injected only if provided
     sections = []
+
+    has_frames = bool(frame_descriptions)
+    mode_label = "full (transcript + visual)" if has_frames else "transcript-only"
 
     sections.append(
         f"You have access to a processed video:\n"
         f"  Title   : {session.get('title', session['video_id'])}\n"
         f"  URL     : {session.get('url', '')}\n"
         f"  Duration: {session.get('duration', 0):.0f}s  |  "
-        f"Frames analyzed: {session.get('frame_count', 0)}"
+        f"Mode: {mode_label}"
     )
 
-    sections.append(
-        f"FRAME-BY-FRAME VISUAL ANALYSIS\n"
-        f"{'─' * 40}\n"
-        f"{all_descriptions}"
-    )
+    if has_frames:
+        all_descriptions = "\n\n".join(
+            f"=== Batch {i + 1} ===\n{d}"
+            for i, d in enumerate(frame_descriptions)
+        )
+        sections.append(
+            f"FRAME-BY-FRAME VISUAL ANALYSIS\n"
+            f"{'─' * 40}\n"
+            f"{all_descriptions}"
+        )
 
     sections.append(
         f"TRANSCRIPT (first 10000 chars)\n"
