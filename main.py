@@ -14,7 +14,11 @@ Commands:
 Examples:
   python main.py extract "https://youtu.be/RnP08K2SAZs"
   python main.py extract "https://youtu.be/RnP08K2SAZs" --transcript-only
+  python main.py extract "https://youtu.be/RnP08K2SAZs" --focus "architecture diagrams"
+  python main.py extract "https://youtu.be/RnP08K2SAZs" --time-range "5:00-15:00"
   python main.py slides "https://youtu.be/RnP08K2SAZs"
+  python main.py slides "https://youtu.be/RnP08K2SAZs" --focus "code examples"
+  python main.py slides "https://youtu.be/RnP08K2SAZs" --timestamps "5:30,10:00,22:15"
   python main.py ask RnP08K2SAZs "What is the entry trigger?"
   python main.py ask RnP08K2SAZs "implement this as a BaseStrategy" \\
       --context ~/algo-bot/backend/core/strategy.py \\
@@ -117,6 +121,12 @@ def cmd_extract(args):
         print(f"  Mode     : scene-detection (legacy)")
     if args.resume:
         print(f"  Resume   : yes")
+    if args.focus:
+        print(f"  Focus    : {args.focus}")
+    if args.time_range:
+        print(f"  Range    : {args.time_range}")
+    if args.timestamps:
+        print(f"  Stamps   : {args.timestamps}")
     print(f"{'=' * 44}\n")
 
     if session_exists(video_id) and not args.force and not args.resume:
@@ -207,6 +217,9 @@ def cmd_extract(args):
                 max_frames=args.max_frames,
                 min_interval=FRAME_SELECTION_MIN_INTERVAL,
                 chapters=chapters,
+                focus=args.focus,
+                time_range=args.time_range,
+                timestamps=args.timestamps,
             )
             print(f"  Identified {len(selections)} key moments from transcript")
             for i, sel in enumerate(selections, 1):
@@ -339,16 +352,24 @@ def cmd_slides(args):
     s_dir = session_dir(video_id)
     sl_dir = s_dir / "slides"
 
+    has_custom_params = bool(args.focus or args.time_range or args.timestamps)
+
     print(f"\n{'=' * 44}")
     print(f"  video-analyzer slides")
     print(f"  Video ID : {video_id}")
     print(f"  Session  : {s_dir}")
     print(f"  Max      : {args.max_slides} slides")
+    if args.focus:
+        print(f"  Focus    : {args.focus}")
+    if args.time_range:
+        print(f"  Range    : {args.time_range}")
+    if args.timestamps:
+        print(f"  Stamps   : {args.timestamps}")
     print(f"{'=' * 44}\n")
 
-    # Cache check
+    # Cache check — skip cache when custom params are set
     slides_meta = sl_dir / "frames.json"
-    if slides_meta.exists() and not args.force:
+    if slides_meta.exists() and not args.force and not has_custom_params:
         slides = json.loads(slides_meta.read_text())
         print(f"Slides already extracted ({len(slides)} slides).")
         print(f"Use --force to re-extract.\n")
@@ -391,6 +412,9 @@ def cmd_slides(args):
         max_slides=args.max_slides,
         min_interval=SLIDE_SELECTION_MIN_INTERVAL,
         chapters=chapters,
+        focus=args.focus,
+        time_range=args.time_range,
+        timestamps=args.timestamps,
     )
     print(f"  Identified {len(selections)} slide moments:")
     for i, sel in enumerate(selections, 1):
@@ -448,6 +472,12 @@ def main():
                            help="Re-extract even if session already exists")
     p_extract.add_argument("--resume", action="store_true",
                            help="Resume from last step — skip completed steps")
+    p_extract.add_argument("--focus", type=str, default="",
+                           help="Focus on specific content (e.g. 'architecture diagrams')")
+    p_extract.add_argument("--time-range", type=str, default="",
+                           help="Restrict to time range: START-END in seconds or MM:SS (e.g. '5:00-15:00')")
+    p_extract.add_argument("--timestamps", type=str, default="",
+                           help="Extract at exact timestamps, bypass AI selection (e.g. '5:30,10:00')")
 
     # ask
     p_ask = sub.add_parser("ask", help="Ask a question about a processed video")
@@ -465,6 +495,12 @@ def main():
                           help=f"Max slides to extract (default {SLIDE_SELECTION_MAX})")
     p_slides.add_argument("--force", action="store_true",
                           help="Re-extract even if slides already exist")
+    p_slides.add_argument("--focus", type=str, default="",
+                          help="Focus on specific content (e.g. 'only code examples')")
+    p_slides.add_argument("--time-range", type=str, default="",
+                          help="Restrict to time range: START-END in seconds or MM:SS (e.g. '5:00-15:00')")
+    p_slides.add_argument("--timestamps", type=str, default="",
+                          help="Extract at exact timestamps, bypass AI selection (e.g. '5:30,10:00')")
 
     # sessions
     sub.add_parser("sessions", help="List all processed videos")

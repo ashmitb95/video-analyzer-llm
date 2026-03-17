@@ -157,7 +157,12 @@ def extract_transcript(url: str) -> str:
 
 
 @mcp.tool()
-def extract_video(url: str) -> str:
+def extract_video(
+    url: str,
+    focus: str = "",
+    time_range: str = "",
+    timestamps: str = "",
+) -> str:
     """
     Full visual processing of a YouTube video: downloads the video,
     extracts key frames, and generates visual descriptions using
@@ -167,11 +172,23 @@ def extract_video(url: str) -> str:
     (e.g. charts, diagrams, code shown on screen, UI elements).
     For most questions about a video, extract_transcript is sufficient.
 
+    Optional parameters for customization:
+    - focus: Natural language instruction to narrow what frames to
+      extract. Examples: "only code examples", "architecture diagrams".
+      The AI will prioritize moments matching this description.
+    - time_range: Restrict extraction to a portion of the video.
+      Format: "START-END" where START/END are seconds or MM:SS.
+      Examples: "300-900", "5:00-15:00".
+    - timestamps: Comma-separated exact timestamps to extract,
+      bypassing AI selection. Format: seconds or MM:SS.
+      Examples: "330,600", "5:30,10:00".
+
     Returns: session_id to use with get_session.
     """
     video_id = _extract_video_id(url)
+    has_custom_params = bool(focus or time_range or timestamps)
 
-    if session_exists(video_id):
+    if session_exists(video_id) and not has_custom_params:
         session = load_session(video_id)
         return json.dumps({
             "status": "already_extracted",
@@ -181,67 +198,80 @@ def extract_video(url: str) -> str:
             "message": f"Session already exists. Use get_session('{video_id}') to access it.",
         })
 
-    s_dir = session_dir(video_id)
-    f_dir = session_frames_dir(video_id)
-    title = _get_title(url)
+    try:
+        s_dir = session_dir(video_id)
+        f_dir = session_frames_dir(video_id)
+        title = _get_title(url)
 
-    video_path, _, chapters = download_video(url, s_dir)
-    transcript = fetch_transcript(video_id, s_dir)
+        video_path, _, chapters = download_video(url, s_dir)
+        transcript = fetch_transcript(video_id, s_dir)
 
-    # Analyze transcript for key visual moments
-    from transcript_selector import select_frames_from_transcript
-    selections = select_frames_from_transcript(
-        transcript=transcript,
-        model=FRAME_SELECTION_MODEL,
-        max_frames=FRAME_SELECTION_MAX,
-        min_interval=FRAME_SELECTION_MIN_INTERVAL,
-        chapters=chapters,
-    )
+        # Analyze transcript for key visual moments
+        from transcript_selector import select_frames_from_transcript
+        selections = select_frames_from_transcript(
+            transcript=transcript,
+            model=FRAME_SELECTION_MODEL,
+            max_frames=FRAME_SELECTION_MAX,
+            min_interval=FRAME_SELECTION_MIN_INTERVAL,
+            chapters=chapters,
+            focus=focus,
+            time_range=time_range,
+            timestamps=timestamps,
+        )
 
-    # Extract targeted frames
-    frames = extract_frames_at_timestamps(
-        video_path=video_path,
-        frames_dir=f_dir,
-        selections=selections,
-        max_width=IMAGE_MAX_WIDTH,
-    )
+        # Extract targeted frames
+        frames = extract_frames_at_timestamps(
+            video_path=video_path,
+            frames_dir=f_dir,
+            selections=selections,
+            max_width=IMAGE_MAX_WIDTH,
+            save_metadata=not has_custom_params,
+        )
 
-    if not frames:
-        return json.dumps({"status": "error", "message": "No frames extracted."})
+        if not frames:
+            return json.dumps({"status": "error", "message": "No frames extracted."})
 
-    # Describe frames
-    descriptions = describe_frames(
-        frames=frames,
-        transcript=transcript,
-        model=CLAUDE_MODEL,
-        transcript_window=TRANSCRIPT_WINDOW,
-        batch_size=MAX_FRAMES_PER_BATCH,
-    )
+        # Describe frames
+        descriptions = describe_frames(
+            frames=frames,
+            transcript=transcript,
+            model=CLAUDE_MODEL,
+            transcript_window=TRANSCRIPT_WINDOW,
+            batch_size=MAX_FRAMES_PER_BATCH,
+        )
 
-    duration = frames[-1]["timestamp"] if frames else 0.0
+        duration = frames[-1]["timestamp"] if frames else 0.0
 
-    save_session(
-        video_id=video_id,
-        url=url,
-        title=title,
-        duration=duration,
-        transcript=transcript,
-        frame_descriptions=descriptions,
-        frames=frames,
-    )
+        if not has_custom_params:
+            save_session(
+                video_id=video_id,
+                url=url,
+                title=title,
+                duration=duration,
+                transcript=transcript,
+                frame_descriptions=descriptions,
+                frames=frames,
+            )
 
-    return json.dumps({
-        "status": "success",
-        "session_id": video_id,
-        "title": title,
-        "frame_count": len(frames),
-        "duration_seconds": duration,
-        "message": f"Session ready. Call get_session('{video_id}') to access the content.",
-    })
+        return json.dumps({
+            "status": "success",
+            "session_id": video_id,
+            "title": title,
+            "frame_count": len(frames),
+            "duration_seconds": duration,
+            "message": f"Session ready. Call get_session('{video_id}') to access the content.",
+        })
+    except ValueError as e:
+        return json.dumps({"status": "error", "message": str(e)})
 
 
 @mcp.tool()
-def extract_slides(url: str) -> str:
+def extract_slides(
+    url: str,
+    focus: str = "",
+    time_range: str = "",
+    timestamps: str = "",
+) -> str:
     """
     Extract presentation-quality slides from a YouTube video.
 
@@ -253,15 +283,30 @@ def extract_slides(url: str) -> str:
     Use this when the user needs visual aids, key screenshots, or
     a slide deck from a video.
 
+    Optional parameters for customization:
+    - focus: Natural language instruction to narrow what slides to
+      extract. Examples: "only code examples", "architecture diagrams",
+      "the section about authentication". When set, the AI prioritizes
+      moments matching this description.
+    - time_range: Restrict extraction to a portion of the video.
+      Format: "START-END" where START/END are seconds or MM:SS.
+      Examples: "300-900", "5:00-15:00". Only extracts slides
+      within this window.
+    - timestamps: Comma-separated list of exact timestamps to extract,
+      bypassing AI selection entirely. Format: seconds or MM:SS.
+      Examples: "330,600", "5:30,10:00". Use when you know exactly
+      which moments to capture.
+
     Returns: slide paths, timestamps, and descriptions.
     """
     video_id = _extract_video_id(url)
     s_dir = session_dir(video_id)
     sl_dir = session_slides_dir(video_id)
+    has_custom_params = bool(focus or time_range or timestamps)
 
-    # Cache check: return existing slides if already extracted
+    # Cache check: only use cache when no custom extraction parameters
     slides_meta = sl_dir / "frames.json"
-    if slides_meta.exists():
+    if slides_meta.exists() and not has_custom_params:
         cached_slides = json.loads(slides_meta.read_text())
         if cached_slides:
             return json.dumps({
@@ -280,92 +325,99 @@ def extract_slides(url: str) -> str:
                 "message": f"Slides already extracted. {len(cached_slides)} slides available.",
             })
 
-    # Ensure video is downloaded
-    video_path = None
-    if s_dir.exists():
-        candidates = [f for f in s_dir.iterdir()
-                      if f.suffix in ('.mp4', '.mkv', '.webm') and f.stem != 'thumbnail']
-        if candidates:
-            video_path = candidates[0]
+    try:
+        # Ensure video is downloaded
+        video_path = None
+        if s_dir.exists():
+            candidates = [f for f in s_dir.iterdir()
+                          if f.suffix in ('.mp4', '.mkv', '.webm') and f.stem != 'thumbnail']
+            if candidates:
+                video_path = candidates[0]
 
-    if video_path is None:
-        video_path, _, chapters = download_video(url, s_dir)
-    else:
-        chapters_file = s_dir / "chapters.json"
-        chapters = json.loads(chapters_file.read_text()) if chapters_file.exists() else []
+        if video_path is None:
+            video_path, _, chapters = download_video(url, s_dir)
+        else:
+            chapters_file = s_dir / "chapters.json"
+            chapters = json.loads(chapters_file.read_text()) if chapters_file.exists() else []
 
-    # Ensure transcript is available
-    transcript_file = s_dir / "transcript.json"
-    if transcript_file.exists():
-        transcript = json.loads(transcript_file.read_text())
-    else:
-        transcript = fetch_transcript(video_id, s_dir)
+        # Ensure transcript is available
+        transcript_file = s_dir / "transcript.json"
+        if transcript_file.exists():
+            transcript = json.loads(transcript_file.read_text())
+        else:
+            transcript = fetch_transcript(video_id, s_dir)
 
-    if not transcript:
-        return json.dumps({
-            "status": "error",
-            "message": "No transcript available for this video. Cannot select slides.",
-        })
+        if not transcript:
+            return json.dumps({
+                "status": "error",
+                "message": "No transcript available for this video. Cannot select slides.",
+            })
 
-    # Select slide-worthy moments
-    from transcript_selector import select_slides_from_transcript
-    selections = select_slides_from_transcript(
-        transcript=transcript,
-        model=FRAME_SELECTION_MODEL,
-        max_slides=SLIDE_SELECTION_MAX,
-        min_interval=SLIDE_SELECTION_MIN_INTERVAL,
-        chapters=chapters,
-    )
-
-    if not selections:
-        return json.dumps({
-            "status": "error",
-            "message": "Could not identify any slide-worthy moments from transcript.",
-        })
-
-    # Extract frames into slides/ directory
-    slides = extract_frames_at_timestamps(
-        video_path=video_path,
-        frames_dir=sl_dir,
-        selections=selections,
-        max_width=IMAGE_MAX_WIDTH,
-    )
-
-    if not slides:
-        return json.dumps({"status": "error", "message": "No slide frames extracted."})
-
-    # Ensure a basic session exists (for list_sessions / get_session)
-    if not session_exists(video_id):
-        title = _get_title(url)
-        duration = 0.0
-        if transcript:
-            last = transcript[-1]
-            duration = last["start"] + last.get("duration", 0)
-        save_session(
-            video_id=video_id,
-            url=url,
-            title=title,
-            duration=duration,
+        # Select slide-worthy moments
+        from transcript_selector import select_slides_from_transcript
+        selections = select_slides_from_transcript(
             transcript=transcript,
-            frame_descriptions=[],
-            frames=[],
+            model=FRAME_SELECTION_MODEL,
+            max_slides=SLIDE_SELECTION_MAX,
+            min_interval=SLIDE_SELECTION_MIN_INTERVAL,
+            chapters=chapters,
+            focus=focus,
+            time_range=time_range,
+            timestamps=timestamps,
         )
 
-    return json.dumps({
-        "status": "success",
-        "session_id": video_id,
-        "slide_count": len(slides),
-        "slides": [
-            {
-                "index": i + 1,
-                "timestamp": s["timestamp"],
-                "path": s["path"],
-                "reason": s.get("reason", ""),
-            }
-            for i, s in enumerate(slides)
-        ],
-        "message": f"Extracted {len(slides)} slides. Paths point to PNG files on disk.",
-    })
+        if not selections:
+            return json.dumps({
+                "status": "error",
+                "message": "Could not identify any slide-worthy moments from transcript.",
+            })
+
+        # Extract frames into slides/ directory
+        slides = extract_frames_at_timestamps(
+            video_path=video_path,
+            frames_dir=sl_dir,
+            selections=selections,
+            max_width=IMAGE_MAX_WIDTH,
+            save_metadata=not has_custom_params,
+        )
+
+        if not slides:
+            return json.dumps({"status": "error", "message": "No slide frames extracted."})
+
+        # Ensure a basic session exists (for list_sessions / get_session)
+        if not session_exists(video_id):
+            title = _get_title(url)
+            duration = 0.0
+            if transcript:
+                last = transcript[-1]
+                duration = last["start"] + last.get("duration", 0)
+            save_session(
+                video_id=video_id,
+                url=url,
+                title=title,
+                duration=duration,
+                transcript=transcript,
+                frame_descriptions=[],
+                frames=[],
+            )
+
+        return json.dumps({
+            "status": "success",
+            "session_id": video_id,
+            "slide_count": len(slides),
+            "slides": [
+                {
+                    "index": i + 1,
+                    "timestamp": s["timestamp"],
+                    "path": s["path"],
+                    "reason": s.get("reason", ""),
+                }
+                for i, s in enumerate(slides)
+            ],
+            "message": f"Extracted {len(slides)} slides. Paths point to PNG files on disk.",
+        })
+    except ValueError as e:
+        return json.dumps({"status": "error", "message": str(e)})
 
 
 @mcp.tool()

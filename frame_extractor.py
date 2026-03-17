@@ -116,12 +116,13 @@ def extract_frames_at_timestamps(
     frames_dir: Path,
     selections: list[dict],
     max_width: int,
+    save_metadata: bool = True,
 ) -> list[dict]:
     """
     Extract frames at specific pre-selected timestamps.
     `selections` is a list of {"timestamp": float, "reason": str}.
     Returns list of dicts: [{'timestamp': float, 'path': str, 'reason': str}, ...]
-    Also writes frames/frames.json.
+    Writes frames/frames.json unless save_metadata is False.
     """
     frames_dir.mkdir(parents=True, exist_ok=True)
 
@@ -137,8 +138,9 @@ def extract_frames_at_timestamps(
         else:
             print(f"  [{i + 1}/{len(selections)}] {ts:.1f}s → FAILED (skipped)")
 
-    (frames_dir / "frames.json").write_text(json.dumps(frames, indent=2))
-    print(f"  Frame metadata saved to {frames_dir / 'frames.json'}")
+    if save_metadata:
+        (frames_dir / "frames.json").write_text(json.dumps(frames, indent=2))
+        print(f"  Frame metadata saved to {frames_dir / 'frames.json'}")
     return frames
 
 
