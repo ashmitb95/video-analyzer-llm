@@ -16,7 +16,6 @@ keywords = [
 dependencies = [
     "yt-dlp",
     "youtube-transcript-api",
-    "anthropic",
     "Pillow",
     "mcp[cli]",
     "python-dotenv",

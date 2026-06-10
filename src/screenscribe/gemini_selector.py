@@ -20,9 +20,8 @@ import time
 from screenscribe.transcript_selector import (
     _parse_time_range,
     _parse_timestamp,
+    _parse_timestamps_list,
     _validate_and_filter,
-    select_frames_from_transcript,
-    select_slides_from_transcript,
 )
 
 MAX_RETRIES = 3
@@ -195,15 +194,23 @@ def select_with_gemini(
     return _validate_and_filter(raw, duration, max_items, min_interval, time_range=parsed_range)
 
 
+def _explicit_timestamps(timestamps, video_duration, max_items, min_interval, time_range):
+    """Honor user-specified timestamps without any model call (no key needed)."""
+    # When the duration is unknown (no transcript), don't bound the upper range —
+    # explicit timestamps should still pass.
+    upper = video_duration if video_duration else float("inf")
+    return _validate_and_filter(
+        _parse_timestamps_list(timestamps), upper, max_items, min_interval,
+        time_range=_parse_time_range(time_range) if time_range else None,
+    )
+
+
 def select_frames(
     youtube_url,
-    transcript,
     *,
-    transcript_model,
     gemini_model,
     max_frames,
     min_interval,
-    chapters,
     focus="",
     time_range="",
     timestamps="",
@@ -211,39 +218,32 @@ def select_frames(
     media_resolution_low=True,
 ) -> list[dict]:
     """
-    Pick frames to capture. Uses Gemini (watches the video) when a key is set;
-    falls back to transcript-based picking otherwise, on error, or when the user
-    passed explicit timestamps (which bypass AI selection entirely).
+    Pick frames to capture. Explicit timestamps bypass AI selection (no key
+    needed); otherwise Gemini watches the video and picks the moments. Selection
+    requires a GEMINI_API_KEY — returns [] if it's unavailable.
     """
-    if gemini_available() and not timestamps:
-        try:
-            sels = select_with_gemini(
-                youtube_url, gemini_model, "frames", max_frames, min_interval,
-                video_duration, focus, time_range, media_resolution_low,
-            )
-            if sels:
-                print(f"  [selection] Gemini watched the video → {len(sels)} moments")
-                return sels
-            print("  [selection] Gemini returned nothing — falling back to transcript")
-        except Exception as e:  # noqa: BLE001
-            print(f"  [selection] Gemini failed ({type(e).__name__}: {str(e)[:100]}) — falling back to transcript")
+    if timestamps:
+        return _explicit_timestamps(timestamps, video_duration, max_frames, min_interval, time_range)
 
-    return select_frames_from_transcript(
-        transcript=transcript, model=transcript_model, max_frames=max_frames,
-        min_interval=min_interval, chapters=chapters, focus=focus,
-        time_range=time_range, timestamps=timestamps,
+    if not gemini_available():
+        print("  [selection] No GEMINI_API_KEY — frame selection unavailable (transcript-only).")
+        return []
+
+    sels = select_with_gemini(
+        youtube_url, gemini_model, "frames", max_frames, min_interval,
+        video_duration, focus, time_range, media_resolution_low,
     )
+    if sels:
+        print(f"  [selection] Gemini watched the video → {len(sels)} moments")
+    return sels
 
 
 def select_slides(
     youtube_url,
-    transcript,
     *,
-    transcript_model,
     gemini_model,
     max_slides,
     min_interval,
-    chapters,
     focus="",
     time_range="",
     timestamps="",
@@ -251,21 +251,17 @@ def select_slides(
     media_resolution_low=True,
 ) -> list[dict]:
     """Slide variant of select_frames (complete, standalone visuals)."""
-    if gemini_available() and not timestamps:
-        try:
-            sels = select_with_gemini(
-                youtube_url, gemini_model, "slides", max_slides, min_interval,
-                video_duration, focus, time_range, media_resolution_low,
-            )
-            if sels:
-                print(f"  [selection] Gemini watched the video → {len(sels)} slides")
-                return sels
-            print("  [selection] Gemini returned nothing — falling back to transcript")
-        except Exception as e:  # noqa: BLE001
-            print(f"  [selection] Gemini failed ({type(e).__name__}: {str(e)[:100]}) — falling back to transcript")
+    if timestamps:
+        return _explicit_timestamps(timestamps, video_duration, max_slides, min_interval, time_range)
 
-    return select_slides_from_transcript(
-        transcript=transcript, model=transcript_model, max_slides=max_slides,
-        min_interval=min_interval, chapters=chapters, focus=focus,
-        time_range=time_range, timestamps=timestamps,
+    if not gemini_available():
+        print("  [selection] No GEMINI_API_KEY — slide selection unavailable (transcript-only).")
+        return []
+
+    sels = select_with_gemini(
+        youtube_url, gemini_model, "slides", max_slides, min_interval,
+        video_duration, focus, time_range, media_resolution_low,
     )
+    if sels:
+        print(f"  [selection] Gemini watched the video → {len(sels)} slides")
+    return sels

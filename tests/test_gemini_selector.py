@@ -67,33 +67,26 @@ def test_dispatcher_uses_gemini_when_available(monkeypatch):
     monkeypatch.setattr(gemini_selector, "gemini_available", lambda: True)
     monkeypatch.setattr(gemini_selector, "select_with_gemini",
                         lambda *a, **k: [{"timestamp": 12.0, "reason": "from gemini"}])
-    out = select_frames("https://youtu.be/x", transcript=[],
-                        transcript_model="m", gemini_model="g",
-                        max_frames=10, min_interval=5.0, chapters=[])
+    out = select_frames("https://youtu.be/x", gemini_model="g",
+                        max_frames=10, min_interval=5.0)
     assert out == [{"timestamp": 12.0, "reason": "from gemini"}]
 
 
-def test_dispatcher_falls_back_to_transcript_on_error(monkeypatch):
-    monkeypatch.setattr(gemini_selector, "gemini_available", lambda: True)
-    def boom(*a, **k):
-        raise RuntimeError("gemini down")
-    monkeypatch.setattr(gemini_selector, "select_with_gemini", boom)
-    monkeypatch.setattr(gemini_selector, "select_frames_from_transcript",
-                        lambda **k: [{"timestamp": 7.0, "reason": "from transcript"}])
-    out = select_frames("https://youtu.be/x", transcript=[],
-                        transcript_model="m", gemini_model="g",
-                        max_frames=10, min_interval=5.0, chapters=[])
-    assert out == [{"timestamp": 7.0, "reason": "from transcript"}]
+def test_returns_empty_without_gemini_key(monkeypatch):
+    # No Gemini key and no explicit timestamps → no frame selection (transcript-only).
+    monkeypatch.setattr(gemini_selector, "gemini_available", lambda: False)
+    out = select_frames("https://youtu.be/x", gemini_model="g",
+                        max_frames=10, min_interval=5.0)
+    assert out == []
 
 
 def test_explicit_timestamps_bypass_gemini(monkeypatch):
-    # Even when Gemini is available, explicit user timestamps skip it entirely.
+    # Even when Gemini is available, explicit user timestamps skip it entirely —
+    # and work with no video duration / no key.
     monkeypatch.setattr(gemini_selector, "gemini_available", lambda: True)
     def fail(*a, **k):
         raise AssertionError("Gemini should not be called when timestamps are given")
     monkeypatch.setattr(gemini_selector, "select_with_gemini", fail)
-    out = select_frames("https://youtu.be/x", transcript=[{"start": 0, "duration": 100, "text": "x"}],
-                        transcript_model="m", gemini_model="g",
-                        max_frames=10, min_interval=5.0, chapters=[],
-                        timestamps="10,20")
+    out = select_frames("https://youtu.be/x", gemini_model="g",
+                        max_frames=10, min_interval=5.0, timestamps="10,20")
     assert [s["timestamp"] for s in out] == [10.0, 20.0]

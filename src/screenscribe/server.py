@@ -1,16 +1,18 @@
 """
 screenscribe MCP server.
 
-Built on Gemini (watches the video to pick frames) + Claude (describes
-frames and answers questions), with a free transcript layer alongside.
+Built on Gemini, which watches the video to pick frames and produce whole-video
+analysis. The agent (the MCP client) does the reasoning over what's returned —
+including viewing the extracted frame images. A free transcript layer runs
+alongside. Needs only a GEMINI_API_KEY (frames/analysis); transcript is free.
 
 Exposes tools to any MCP client (Claude Code, Claude Desktop, etc.):
-  extract_transcript(url)    — fast: fetch transcript only (no API cost)
+  extract_transcript(url)    — fast: fetch transcript only (free, no key)
   analyze_video(url)         — cheap: Gemini watches the whole video → structured analysis
-  extract_video(url)         — full: Gemini picks frames, ffmpeg extracts, Claude Vision describes
-  extract_slides(url)        — Gemini picks complete on-screen visuals, extracted as PNGs
+  extract_frames(url, style) — Gemini picks moments, ffmpeg extracts PNGs the agent views
+                               (style="keyframes" | "slides")
   get_video_analysis(id)     — read Gemini's whole-video analysis
-  get_session(session_id)    — return session data with analysis source metadata
+  get_session(session_id)    — return session data (transcript, analysis, frame paths)
   list_sessions()            — list all processed videos
 
 Claude Code usage:
@@ -41,20 +43,15 @@ load_dotenv()
 
 from mcp.server.fastmcp import FastMCP
 
-from screenscribe.analyzer import describe_frames
 from screenscribe.config import (
-    CLAUDE_MODEL,
     FRAME_SELECTION_MAX,
     FRAME_SELECTION_MIN_INTERVAL,
-    FRAME_SELECTION_MODEL,
     GEMINI_MEDIA_RESOLUTION_LOW,
     GEMINI_MODEL,
     IMAGE_MAX_WIDTH,
-    MAX_FRAMES_PER_BATCH,
     MAX_INLINE_TRANSCRIPT_CHARS,
     SLIDE_SELECTION_MAX,
     SLIDE_SELECTION_MIN_INTERVAL,
-    TRANSCRIPT_WINDOW,
 )
 from screenscribe.downloader import download_video, fetch_transcript
 from screenscribe.frame_extractor import extract_frames_at_timestamps
@@ -142,7 +139,6 @@ def extract_transcript(url: str) -> str:
         title=title,
         duration=duration,
         transcript=transcript,
-        frame_descriptions=[],
         frames=[],
     )
 
@@ -159,284 +155,148 @@ def extract_transcript(url: str) -> str:
 
 
 @mcp.tool()
-def extract_video(
+def extract_frames(
     url: str,
+    style: str = "keyframes",
     focus: str = "",
     time_range: str = "",
     timestamps: str = "",
 ) -> str:
     """
-    Full visual analysis of a YouTube video: Gemini watches the video to
-    pick the key frames, ffmpeg extracts them, and Claude Vision describes
-    each one. Slow (~2 min) and uses API credits. Works on any kind of
-    video, not just screen recordings.
+    Extract frames from a YouTube video as PNG images you (the agent) can open and
+    read directly. Gemini watches the video to pick the moments; ffmpeg extracts
+    them. There is no server-side description step — you view the images yourself.
 
-    Only use this when the user specifically needs visual analysis
-    (what's shown on screen, diagrams, demonstrations, UI, scenes, etc.).
-    For most questions about a video, extract_transcript is sufficient.
+    Use this when the user needs the actual visuals (what's on screen: code,
+    diagrams, UI, demonstrations, scenes). For text-only questions,
+    extract_transcript or analyze_video is usually enough.
 
-    Optional parameters for customization:
-    - focus: Natural language instruction to narrow what frames to
-      extract. Examples: "only code examples", "architecture diagrams".
-      The AI will prioritize moments matching this description.
-    - time_range: Restrict extraction to a portion of the video.
-      Format: "START-END" where START/END are seconds or MM:SS.
-      Examples: "300-900", "5:00-15:00".
-    - timestamps: Comma-separated exact timestamps to extract,
-      bypassing AI selection. Format: seconds or MM:SS.
-      Examples: "330,600", "5:30,10:00".
+    style:
+    - "keyframes" (default): a denser set of visually important moments.
+    - "slides": fewer, complete standalone visuals (finished diagrams, charts,
+      code, summaries) that work as a slide deck.
 
-    Returns: session_id to use with get_session.
+    Requires GEMINI_API_KEY for selection — UNLESS you pass explicit `timestamps`.
+
+    Optional:
+    - focus: narrow what to capture, e.g. "only code examples".
+    - time_range: "START-END" in seconds or MM:SS, e.g. "5:00-15:00".
+    - timestamps: comma-separated exact timestamps (seconds or MM:SS), bypassing
+      AI selection, e.g. "5:30,10:00".
+
+    Returns: the saved PNG paths + timestamps + reasons. Open the images to read
+    what is on screen.
     """
-    video_id = _extract_video_id(url)
-    has_custom_params = bool(focus or time_range or timestamps)
+    from screenscribe.gemini_selector import gemini_available, select_frames, select_slides
 
-    if session_exists(video_id) and not has_custom_params:
-        session = load_session(video_id)
+    if style not in ("keyframes", "slides"):
+        return json.dumps({"status": "error", "message": f"Unknown style '{style}'. Use 'keyframes' or 'slides'."})
+
+    if not timestamps and not gemini_available():
         return json.dumps({
-            "status": "already_extracted",
-            "session_id": video_id,
-            "title": session.get("title", "Unknown"),
-            "frame_count": session.get("frame_count", 0),
-            "message": f"Session already exists. Use get_session('{video_id}') to access it.",
+            "status": "error",
+            "message": "extract_frames needs GEMINI_API_KEY (Gemini watches the video to pick frames). "
+                       "Pass explicit `timestamps` to bypass selection, or use extract_transcript for text only.",
         })
 
     try:
-        s_dir = session_dir(video_id)
-        f_dir = session_frames_dir(video_id)
-        title = _get_title(url)
-
-        video_path, _, chapters = download_video(url, s_dir)
-        transcript = fetch_transcript(video_id, s_dir)
-
-        # Identify key visual moments — Gemini watches the video when a key is
-        # set, otherwise falls back to transcript-based picking.
-        from screenscribe.gemini_selector import select_frames
-        video_duration = (
-            transcript[-1]["start"] + transcript[-1].get("duration", 0)
-            if transcript else 0.0
-        )
-        selections = select_frames(
-            url,
-            transcript,
-            transcript_model=FRAME_SELECTION_MODEL,
-            gemini_model=GEMINI_MODEL,
-            max_frames=FRAME_SELECTION_MAX,
-            min_interval=FRAME_SELECTION_MIN_INTERVAL,
-            chapters=chapters,
-            focus=focus,
-            time_range=time_range,
-            timestamps=timestamps,
-            video_duration=video_duration,
-            media_resolution_low=GEMINI_MEDIA_RESOLUTION_LOW,
-        )
-
-        # Extract targeted frames
-        frames = extract_frames_at_timestamps(
-            video_path=video_path,
-            frames_dir=f_dir,
-            selections=selections,
-            max_width=IMAGE_MAX_WIDTH,
-            save_metadata=not has_custom_params,
-        )
-
-        if not frames:
-            return json.dumps({"status": "error", "message": "No frames extracted."})
-
-        # Describe frames
-        descriptions = describe_frames(
-            frames=frames,
-            transcript=transcript,
-            model=CLAUDE_MODEL,
-            transcript_window=TRANSCRIPT_WINDOW,
-            batch_size=MAX_FRAMES_PER_BATCH,
-        )
-
-        duration = frames[-1]["timestamp"] if frames else 0.0
-
-        if not has_custom_params:
-            save_session(
-                video_id=video_id,
-                url=url,
-                title=title,
-                duration=duration,
-                transcript=transcript,
-                frame_descriptions=descriptions,
-                frames=frames,
-            )
-
-        return json.dumps({
-            "status": "success",
-            "session_id": video_id,
-            "title": title,
-            "frame_count": len(frames),
-            "duration_seconds": duration,
-            "message": f"Session ready. Call get_session('{video_id}') to access the content.",
-        })
+        video_id = _extract_video_id(url)
     except ValueError as e:
         return json.dumps({"status": "error", "message": str(e)})
 
-
-@mcp.tool()
-def extract_slides(
-    url: str,
-    focus: str = "",
-    time_range: str = "",
-    timestamps: str = "",
-) -> str:
-    """
-    Extract presentation-quality slides from a YouTube video.
-
-    Gemini watches the video to find moments where a complete,
-    self-contained visual is on screen (diagram, chart, scene, code,
-    summary), then ffmpeg extracts those frames as PNG images. Faster
-    and cheaper than extract_video — frame selection only, no Claude
-    Vision descriptions.
-
-    Use this when the user needs visual aids, key screenshots, or
-    a slide deck from a video.
-
-    Optional parameters for customization:
-    - focus: Natural language instruction to narrow what slides to
-      extract. Examples: "only code examples", "architecture diagrams",
-      "the section about authentication". When set, the AI prioritizes
-      moments matching this description.
-    - time_range: Restrict extraction to a portion of the video.
-      Format: "START-END" where START/END are seconds or MM:SS.
-      Examples: "300-900", "5:00-15:00". Only extracts slides
-      within this window.
-    - timestamps: Comma-separated list of exact timestamps to extract,
-      bypassing AI selection entirely. Format: seconds or MM:SS.
-      Examples: "330,600", "5:30,10:00". Use when you know exactly
-      which moments to capture.
-
-    Returns: slide paths, timestamps, and descriptions.
-    """
-    video_id = _extract_video_id(url)
     s_dir = session_dir(video_id)
-    sl_dir = session_slides_dir(video_id)
+    out_dir = session_slides_dir(video_id) if style == "slides" else session_frames_dir(video_id)
     has_custom_params = bool(focus or time_range or timestamps)
 
-    # Cache check: only use cache when no custom extraction parameters
-    slides_meta = sl_dir / "frames.json"
-    if slides_meta.exists() and not has_custom_params:
-        cached_slides = json.loads(slides_meta.read_text())
-        if cached_slides:
+    # Cache: reuse a prior extraction of this style when no custom params are set.
+    meta = out_dir / "frames.json"
+    if meta.exists() and not has_custom_params:
+        cached = json.loads(meta.read_text())
+        if cached:
             return json.dumps({
                 "status": "cached",
                 "session_id": video_id,
-                "slide_count": len(cached_slides),
-                "slides": [
-                    {
-                        "index": i + 1,
-                        "timestamp": s["timestamp"],
-                        "path": s["path"],
-                        "reason": s.get("reason", ""),
-                    }
-                    for i, s in enumerate(cached_slides)
+                "style": style,
+                "frame_count": len(cached),
+                "frames": [
+                    {"index": i + 1, "timestamp": f["timestamp"], "path": f["path"], "reason": f.get("reason", "")}
+                    for i, f in enumerate(cached)
                 ],
-                "message": f"Slides already extracted. {len(cached_slides)} slides available.",
+                "message": f"{len(cached)} {style} frames already extracted.",
             })
 
     try:
-        # Ensure video is downloaded
+        # Reuse a previously downloaded video if present, else download.
         video_path = None
         if s_dir.exists():
             candidates = [f for f in s_dir.iterdir()
                           if f.suffix in ('.mp4', '.mkv', '.webm') and f.stem != 'thumbnail']
             if candidates:
                 video_path = candidates[0]
-
         if video_path is None:
-            video_path, _, chapters = download_video(url, s_dir)
-        else:
-            chapters_file = s_dir / "chapters.json"
-            chapters = json.loads(chapters_file.read_text()) if chapters_file.exists() else []
+            video_path, _, _ = download_video(url, s_dir)
 
-        # Ensure transcript is available
         transcript_file = s_dir / "transcript.json"
         if transcript_file.exists():
             transcript = json.loads(transcript_file.read_text())
         else:
             transcript = fetch_transcript(video_id, s_dir)
 
-        if not transcript:
-            return json.dumps({
-                "status": "error",
-                "message": "No transcript available for this video. Cannot select slides.",
-            })
-
-        # Select slide-worthy moments — Gemini watches the video when a key is
-        # set, otherwise falls back to transcript-based picking.
-        from screenscribe.gemini_selector import select_slides
         video_duration = (
-            transcript[-1]["start"] + transcript[-1].get("duration", 0)
-            if transcript else 0.0
+            transcript[-1]["start"] + transcript[-1].get("duration", 0) if transcript else 0.0
         )
-        selections = select_slides(
-            url,
-            transcript,
-            transcript_model=FRAME_SELECTION_MODEL,
-            gemini_model=GEMINI_MODEL,
-            max_slides=SLIDE_SELECTION_MAX,
-            min_interval=SLIDE_SELECTION_MIN_INTERVAL,
-            chapters=chapters,
-            focus=focus,
-            time_range=time_range,
-            timestamps=timestamps,
-            video_duration=video_duration,
-            media_resolution_low=GEMINI_MEDIA_RESOLUTION_LOW,
-        )
+
+        if style == "slides":
+            selections = select_slides(
+                url, gemini_model=GEMINI_MODEL, max_slides=SLIDE_SELECTION_MAX,
+                min_interval=SLIDE_SELECTION_MIN_INTERVAL, focus=focus, time_range=time_range,
+                timestamps=timestamps, video_duration=video_duration,
+                media_resolution_low=GEMINI_MEDIA_RESOLUTION_LOW,
+            )
+        else:
+            selections = select_frames(
+                url, gemini_model=GEMINI_MODEL, max_frames=FRAME_SELECTION_MAX,
+                min_interval=FRAME_SELECTION_MIN_INTERVAL, focus=focus, time_range=time_range,
+                timestamps=timestamps, video_duration=video_duration,
+                media_resolution_low=GEMINI_MEDIA_RESOLUTION_LOW,
+            )
 
         if not selections:
-            return json.dumps({
-                "status": "error",
-                "message": "Could not identify any slide-worthy moments from transcript.",
-            })
+            return json.dumps({"status": "error", "message": "No moments were selected."})
 
-        # Extract frames into slides/ directory
-        slides = extract_frames_at_timestamps(
+        frames = extract_frames_at_timestamps(
             video_path=video_path,
-            frames_dir=sl_dir,
+            frames_dir=out_dir,
             selections=selections,
             max_width=IMAGE_MAX_WIDTH,
             save_metadata=not has_custom_params,
         )
+        if not frames:
+            return json.dumps({"status": "error", "message": "No frames extracted."})
 
-        if not slides:
-            return json.dumps({"status": "error", "message": "No slide frames extracted."})
-
-        # Ensure a basic session exists (for list_sessions / get_session)
-        if not session_exists(video_id):
-            title = _get_title(url)
-            duration = 0.0
-            if transcript:
-                last = transcript[-1]
-                duration = last["start"] + last.get("duration", 0)
+        # Persist: keyframes go into the session (so get_session can surface them);
+        # slides live in slides/frames.json. Always ensure a session exists.
+        if style == "keyframes" and not has_custom_params:
             save_session(
-                video_id=video_id,
-                url=url,
-                title=title,
-                duration=duration,
-                transcript=transcript,
-                frame_descriptions=[],
-                frames=[],
+                video_id=video_id, url=url, title=_get_title(url),
+                duration=video_duration, transcript=transcript, frames=frames,
+            )
+        elif not session_exists(video_id):
+            save_session(
+                video_id=video_id, url=url, title=_get_title(url),
+                duration=video_duration, transcript=transcript, frames=[],
             )
 
         return json.dumps({
             "status": "success",
             "session_id": video_id,
-            "slide_count": len(slides),
-            "slides": [
-                {
-                    "index": i + 1,
-                    "timestamp": s["timestamp"],
-                    "path": s["path"],
-                    "reason": s.get("reason", ""),
-                }
-                for i, s in enumerate(slides)
+            "style": style,
+            "frame_count": len(frames),
+            "frames": [
+                {"index": i + 1, "timestamp": f["timestamp"], "path": f["path"], "reason": f.get("reason", "")}
+                for i, f in enumerate(frames)
             ],
-            "message": f"Extracted {len(slides)} slides. Paths point to PNG files on disk.",
+            "message": f"Extracted {len(frames)} {style} frames. Open the PNG paths to view them.",
         })
     except ValueError as e:
         return json.dumps({"status": "error", "message": str(e)})
@@ -502,8 +362,7 @@ def analyze_video(url: str, focus: str = "", time_range: str = "") -> str:
                 duration = last["start"] + last.get("duration", 0)
             save_session(
                 video_id=video_id, url=url, title=_get_title(url),
-                duration=duration, transcript=transcript,
-                frame_descriptions=[], frames=[],
+                duration=duration, transcript=transcript, frames=[],
             )
 
         resp = {
@@ -540,43 +399,38 @@ def get_video_analysis(session_id: str) -> str:
 @mcp.tool()
 def get_session(session_id: str) -> str:
     """
-    Return the full processed content of a video session:
-    transcript and (if available) frame-by-frame visual descriptions.
+    Return the full processed content of a video session: the transcript, any
+    Gemini whole-video analysis, and the paths of any extracted key frames.
 
-    The response includes an 'analysis_source' field that tells you
-    exactly what data is available. ALWAYS mention the source when
-    answering questions — e.g. "Based on the transcript..." or
-    "Based on transcript + visual analysis of N frames...".
+    The response includes an 'analysis_source' field telling you exactly what data
+    is available. ALWAYS mention the source when answering — e.g. "Based on the
+    transcript..." or "Based on transcript + N extracted frames...". When frames
+    are present, open the PNG paths to read what is on screen.
 
-    Use the returned content to answer questions about the video.
-    You (Claude) provide any codebase/project context from the
-    current conversation — no need to pass it here.
+    You (the agent) provide any codebase/project context from the current
+    conversation — no need to pass it here.
 
     Args:
-        session_id: The video ID returned by extract_transcript, extract_video, or list_sessions.
+        session_id: The video ID returned by extract_transcript, extract_frames, or list_sessions.
     """
     try:
         session = load_session(session_id)
     except FileNotFoundError:
         return json.dumps({
             "error": f"No session found for '{session_id}'.",
-            "hint": "Run extract_transcript(url) or extract_video(url) first.",
+            "hint": "Run extract_transcript(url) or extract_frames(url) first.",
         })
 
     full_transcript = " ".join(seg["text"] for seg in session["transcript"])
-    frame_descriptions = session.get("frame_descriptions", [])
     frames = session.get("frames", [])
     gemini_analysis = load_analysis(session_id)
 
     # Build analysis source metadata
-    if frame_descriptions:
+    if frames:
         analysis_source = {
-            "type": "transcript + video analysis",
-            "frames_analyzed": len(frames),
-            "frame_timestamps": [
-                {"timestamp": f["timestamp"], "reason": f.get("reason", "")}
-                for f in frames
-            ],
+            "type": "transcript + extracted frames",
+            "frames": len(frames),
+            "note": "Open the frame `path`s to view what is on screen.",
         }
     elif gemini_analysis:
         analysis_source = {
@@ -586,7 +440,7 @@ def get_session(session_id: str) -> str:
     else:
         analysis_source = {
             "type": "transcript only",
-            "note": "No visual analysis was performed. Answers are based solely on the transcript.",
+            "note": "No frames extracted. Answers are based solely on the transcript.",
         }
 
     # Return the full transcript inline. Only when it exceeds a generous cap do
@@ -604,7 +458,10 @@ def get_session(session_id: str) -> str:
         "extracted_at": session.get("extracted_at", ""),
         "analysis_source": analysis_source,
         "gemini_analysis": gemini_analysis,
-        "frame_descriptions": frame_descriptions,
+        "frames": [
+            {"timestamp": f.get("timestamp"), "path": f.get("path"), "reason": f.get("reason", "")}
+            for f in frames
+        ],
         "transcript": transcript_inline,
         "transcript_chars": len(full_transcript),
         "transcript_truncated": truncated,

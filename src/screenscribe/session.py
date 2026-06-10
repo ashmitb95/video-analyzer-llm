@@ -58,7 +58,6 @@ def save_session(
     title: str,
     duration: float,
     transcript: list[dict],
-    frame_descriptions: list[str],
     frames: list[dict],
 ) -> Path:
     """Persist session data. Returns the path to session.json."""
@@ -73,7 +72,6 @@ def save_session(
         "extracted_at": datetime.now(timezone.utc).isoformat(),
         "frame_count": len(frames),
         "transcript": transcript,
-        "frame_descriptions": frame_descriptions,
         "frames": frames,
     }
     path.write_text(json.dumps(data, indent=2))
