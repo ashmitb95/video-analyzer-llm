@@ -39,6 +39,15 @@ def _parse_video_id(url: str) -> str | None:
     return None
 
 
+def parse_video_id(url: str) -> str:
+    """Return the video ID for a single-video URL; raise ValueError if it isn't one.
+    The canonical single-video parser — other modules delegate here."""
+    vid = _parse_video_id(url)
+    if vid is None:
+        raise ValueError(f"Cannot extract video ID from: {url}")
+    return vid
+
+
 def _looks_like_youtube(url: str) -> bool:
     return "youtube.com" in url or "youtu.be" in url
 
