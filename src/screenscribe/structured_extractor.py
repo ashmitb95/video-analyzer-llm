@@ -1,0 +1,118 @@
+"""
+Schema-driven (typed) extraction.
+
+Hand it a JSON Schema (or a preset name) and it asks Gemini to watch the whole
+video and return JSON conforming to that shape, validated with jsonschema. The
+pure helpers here (resolve/validate/prompt/key) are SDK-free and unit-tested;
+extract_structured() does the one network call + retry.
+"""
+
+import hashlib
+import json
+import re
+from pathlib import Path
+
+import jsonschema
+
+from screenscribe.config import GEMINI_MEDIA_RESOLUTION_LOW, GEMINI_MODEL
+from screenscribe.session import session_dir
+from screenscribe.transcript_selector import _parse_time_range
+
+_SCHEMAS_DIR = Path(__file__).parent / "schemas"
+
+
+def list_presets() -> list[str]:
+    return sorted(p.stem for p in _SCHEMAS_DIR.glob("*.json"))
+
+
+def load_preset(name: str) -> dict | None:
+    path = _SCHEMAS_DIR / f"{name}.json"
+    if not path.exists():
+        return None
+    return json.loads(path.read_text())
+
+
+def resolve_schema(arg) -> dict:
+    """Resolve a schema arg: dict (inline) | preset name | file path | inline JSON string."""
+    if isinstance(arg, dict):
+        return arg
+    if not isinstance(arg, str):
+        raise ValueError(f"schema must be a dict or string, got {type(arg).__name__}")
+
+    preset = load_preset(arg)
+    if preset is not None:
+        return preset
+
+    path = Path(arg)
+    if path.exists():
+        return json.loads(path.read_text())
+
+    try:
+        parsed = json.loads(arg)
+    except json.JSONDecodeError:
+        raise ValueError(
+            f"Schema '{arg[:40]}' is not a known preset, an existing file, or valid JSON. "
+            f"Presets: {', '.join(list_presets())}"
+        )
+    if not isinstance(parsed, dict):
+        raise ValueError("Inline schema JSON must be an object.")
+    return parsed
+
+
+def schema_key(arg) -> str:
+    """Cache key: a preset name as-is, else sha256[:12] of the canonical schema JSON."""
+    if isinstance(arg, str) and load_preset(arg) is not None:
+        return arg
+    schema = resolve_schema(arg)
+    canonical = json.dumps(schema, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()[:12]
+
+
+def validate_output(raw_text, schema) -> tuple[bool, dict | None, str]:
+    """(ok, data, error_message). Pure — no SDK."""
+    try:
+        data = json.loads(raw_text)
+    except (json.JSONDecodeError, TypeError) as e:
+        return False, None, f"Response was not valid JSON: {e}"
+    try:
+        jsonschema.validate(data, schema)
+    except jsonschema.ValidationError as e:
+        return False, None, e.message
+    return True, data, ""
+
+
+def build_extraction_prompt(schema, focus) -> str:
+    body = (
+        "Watch this entire video and extract the requested information, using what is "
+        "shown on screen as well as the narration. Return ONLY JSON that conforms to the "
+        "provided schema. Use timestamps in seconds as numbers. Omit fields the video "
+        "does not provide, unless the schema marks them required.\n"
+        "The video may be in any language. Transcribe the spoken narration and read any "
+        "on-screen text regardless of language; transliterate names into the Latin "
+        "alphabet when helpful.\n"
+    )
+    description = schema.get("description")
+    if description:
+        body += f"\nWhat to extract: {description}\n"
+    if focus:
+        body += f'\nFOCUS: Pay special attention to "{focus}".\n'
+    return body
+
+
+_VIDEO_ID_PATTERNS = [
+    r"youtu\.be/([^?&/]+)",
+    r"youtube\.com/watch\?v=([^&]+)",
+    r"youtube\.com/shorts/([^?&/]+)",
+]
+
+
+def _video_id(url: str) -> str:
+    for pattern in _VIDEO_ID_PATTERNS:
+        m = re.search(pattern, url)
+        if m:
+            return m.group(1)
+    raise ValueError(f"Cannot extract video ID from: {url}")
+
+
+def _cache_path(video_id: str, key: str) -> Path:
+    return session_dir(video_id) / "structured" / f"{key}.json"

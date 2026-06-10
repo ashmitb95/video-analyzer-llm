@@ -23,3 +23,80 @@ def test_preset_is_valid_json_schema(name):
     # Raises SchemaError if the schema itself is malformed.
     jsonschema.Draft202012Validator.check_schema(schema)
     assert schema.get("type") == "object"
+
+
+from screenscribe.structured_extractor import (
+    build_extraction_prompt,
+    list_presets,
+    load_preset,
+    resolve_schema,
+    schema_key,
+    validate_output,
+)
+
+
+def test_list_presets_returns_all_seven():
+    assert set(list_presets()) == EXPECTED_PRESETS
+
+
+def test_load_preset_known_and_unknown():
+    assert load_preset("cli_commands")["type"] == "object"
+    assert load_preset("nope") is None
+
+
+def test_resolve_schema_dict_passthrough():
+    s = {"type": "object"}
+    assert resolve_schema(s) is s
+
+
+def test_resolve_schema_preset_name():
+    assert resolve_schema("cli_commands")["type"] == "object"
+
+
+def test_resolve_schema_inline_json():
+    assert resolve_schema('{"type": "array"}') == {"type": "array"}
+
+
+def test_resolve_schema_file_path(tmp_path):
+    p = tmp_path / "shape.json"
+    p.write_text('{"type": "object"}')
+    assert resolve_schema(str(p)) == {"type": "object"}
+
+
+def test_resolve_schema_unknown_raises():
+    with pytest.raises(ValueError):
+        resolve_schema("this is not json, a file, or a preset")
+
+
+def test_schema_key_preset_is_name():
+    assert schema_key("cli_commands") == "cli_commands"
+
+
+def test_schema_key_freeform_is_stable_12_hex():
+    a = schema_key({"b": 1, "a": 2})
+    b = schema_key({"a": 2, "b": 1})
+    assert a == b
+    assert len(a) == 12 and all(c in "0123456789abcdef" for c in a)
+
+
+def test_validate_output_accepts_valid():
+    schema = {"type": "object", "properties": {"n": {"type": "number"}}, "required": ["n"]}
+    ok, data, err = validate_output('{"n": 5}', schema)
+    assert ok and data == {"n": 5} and err == ""
+
+
+def test_validate_output_rejects_schema_violation():
+    schema = {"type": "object", "properties": {"n": {"type": "number"}}, "required": ["n"]}
+    ok, data, err = validate_output('{"n": "five"}', schema)
+    assert not ok and data is None and err
+
+
+def test_validate_output_rejects_malformed_json():
+    ok, data, err = validate_output("not json", {"type": "object"})
+    assert not ok and "JSON" in err
+
+
+def test_build_extraction_prompt_includes_focus_and_description():
+    schema = {"type": "object", "description": "the CLI commands"}
+    prompt = build_extraction_prompt(schema, "auth setup")
+    assert "the CLI commands" in prompt and "auth setup" in prompt
