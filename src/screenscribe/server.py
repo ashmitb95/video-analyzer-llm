@@ -37,7 +37,6 @@ questions with full repo context.
 """
 
 import json
-import re
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -71,17 +70,7 @@ from screenscribe.session import (
 mcp = FastMCP("screenscribe")
 
 
-def _extract_video_id(url: str) -> str:
-    patterns = [
-        r"youtu\.be/([^?&/]+)",
-        r"youtube\.com/watch\?v=([^&]+)",
-        r"youtube\.com/shorts/([^?&/]+)",
-    ]
-    for p in patterns:
-        m = re.search(p, url)
-        if m:
-            return m.group(1)
-    raise ValueError(f"Cannot extract video ID from: {url}")
+from screenscribe.resolver import parse_video_id as _extract_video_id
 
 
 def _get_title(url: str) -> str:

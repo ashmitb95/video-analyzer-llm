@@ -9,12 +9,12 @@ extract_structured() does the one network call + retry.
 
 import hashlib
 import json
-import re
 from pathlib import Path
 
 import jsonschema
 
 from screenscribe.config import GEMINI_MEDIA_RESOLUTION_LOW, GEMINI_MODEL
+from screenscribe.resolver import parse_video_id as _video_id
 from screenscribe.session import session_dir
 from screenscribe.transcript_selector import _parse_time_range
 
@@ -97,21 +97,6 @@ def build_extraction_prompt(schema, focus) -> str:
     if focus:
         body += f'\nFOCUS: Pay special attention to "{focus}".\n'
     return body
-
-
-_VIDEO_ID_PATTERNS = [
-    r"youtu\.be/([^?&/]+)",
-    r"youtube\.com/watch\?v=([^&]+)",
-    r"youtube\.com/shorts/([^?&/]+)",
-]
-
-
-def _video_id(url: str) -> str:
-    for pattern in _VIDEO_ID_PATTERNS:
-        m = re.search(pattern, url)
-        if m:
-            return m.group(1)
-    raise ValueError(f"Cannot extract video ID from: {url}")
 
 
 def _cache_path(video_id: str, key: str) -> Path:

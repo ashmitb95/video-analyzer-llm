@@ -24,7 +24,6 @@ Examples:
 
 import argparse
 import json
-import re
 import sys
 
 from dotenv import load_dotenv
@@ -56,18 +55,7 @@ from screenscribe.session import (
 )
 
 
-def extract_video_id(url: str) -> str:
-    patterns = [
-        r"youtu\.be/([^?&/]+)",
-        r"youtube\.com/watch\?v=([^&]+)",
-        r"youtube\.com/embed/([^?&/]+)",
-        r"youtube\.com/shorts/([^?&/]+)",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, url)
-        if match:
-            return match.group(1)
-    raise ValueError(f"Cannot extract video ID from: {url}")
+from screenscribe.resolver import parse_video_id as extract_video_id
 
 
 def get_video_title(url: str) -> str:
