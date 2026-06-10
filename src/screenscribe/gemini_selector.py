@@ -94,7 +94,8 @@ def _build_prompt(purpose: str, max_items: int, focus: str) -> str:
     return body
 
 
-def _call_gemini(youtube_url, model, prompt, parsed_range, media_resolution_low, response_schema=None):
+def _call_gemini(youtube_url, model, prompt, parsed_range, media_resolution_low,
+                 response_schema=None, response_json_schema=None):
     """Run one Gemini call over a YouTube URL and return the JSON text. Shared by
     frame selection and whole-video analysis (each passes its own response_schema)."""
     from google import genai
@@ -113,15 +114,23 @@ def _call_gemini(youtube_url, model, prompt, parsed_range, media_resolution_low,
         file_data=types.FileData(file_uri=youtube_url),
         video_metadata=video_metadata,
     )
-    config = types.GenerateContentConfig(
-        response_mime_type="application/json",
-        response_schema=response_schema or _frame_schema(),
-        media_resolution=(
-            types.MediaResolution.MEDIA_RESOLUTION_LOW
-            if media_resolution_low
-            else types.MediaResolution.MEDIA_RESOLUTION_MEDIUM
-        ),
+    media_resolution = (
+        types.MediaResolution.MEDIA_RESOLUTION_LOW
+        if media_resolution_low
+        else types.MediaResolution.MEDIA_RESOLUTION_MEDIUM
     )
+    if response_json_schema is not None:
+        config = types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_json_schema=response_json_schema,
+            media_resolution=media_resolution,
+        )
+    else:
+        config = types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=response_schema or _frame_schema(),
+            media_resolution=media_resolution,
+        )
 
     last_err = None
     for attempt in range(1, MAX_RETRIES + 1):
