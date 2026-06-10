@@ -11,6 +11,7 @@ Exposes tools to any MCP client (Claude Code, Claude Desktop, etc.):
   analyze_video(url)         — cheap: Gemini watches the whole video → structured analysis
   extract_frames(url, style) — Gemini picks moments, ffmpeg extracts PNGs the agent views
                                (style="keyframes" | "slides")
+  extract_structured(url, schema) — extract typed JSON against a schema/preset
   get_video_analysis(id)     — read Gemini's whole-video analysis
   get_session(session_id)    — return session data (transcript, analysis, frame paths)
   list_sessions()            — list all processed videos
@@ -24,14 +25,14 @@ Claude Code usage:
         "screenscribe": {
           "command": "uvx",
           "args": ["screenscribe-mcp"],
-          "env": { "ANTHROPIC_API_KEY": "sk-ant-...", "GEMINI_API_KEY": "..." }
+          "env": { "GEMINI_API_KEY": "..." }
         }
       }
     }
-  (Keys are also read from the shell environment / a .env in the working dir.)
+  (The key is also read from the shell environment / a .env in the working dir.)
 
-Then in Claude Code, just mention a YouTube URL — Claude will call
-extract_video automatically if needed, then use get_session to answer
+Then in your client, just mention a YouTube URL — the agent will call
+extract_frames / analyze_video as needed, then use get_session to answer
 questions with full repo context.
 """
 
@@ -104,7 +105,7 @@ def extract_transcript(url: str) -> str:
     discuss, summarize, or ask questions about its content. For most
     videos the transcript alone is sufficient.
 
-    Only use extract_video instead if the user specifically needs
+    Only use extract_frames instead if the user specifically needs
     visual/frame analysis (e.g. "what's shown on screen", charts,
     diagrams, code on screen).
 
@@ -308,14 +309,13 @@ def analyze_video(url: str, focus: str = "", time_range: str = "") -> str:
     Whole-video visual analysis with Gemini — cheap and fast. Gemini watches the
     entire video and returns a structured understanding: a summary, a section/
     topic breakdown with timestamps, the key moments (with what is on screen),
-    and notable on-screen text/data. No download, no frame extraction, no Claude
-    Vision pass.
+    and notable on-screen text/data. No download, no frame extraction.
 
     This is the sweet spot between extract_transcript (free, words only) and
-    extract_video (frames described by Claude Vision): whole-video visual
-    coverage for a fraction of the cost. Use it to summarise, outline, or answer
-    "what is shown / what happens" questions. Use extract_video / extract_slides
-    only when you need the actual frame images saved on disk.
+    extract_frames (the actual frame images): whole-video visual coverage for a
+    fraction of the cost. Use it to summarise, outline, or answer "what is shown /
+    what happens" questions. Use extract_frames only when you need the frame
+    images saved on disk for the agent to view.
 
     Optional:
     - focus: pay special attention to a subject (e.g. "the demo", "pricing").
@@ -470,6 +470,35 @@ def get_session(session_id: str) -> str:
 
 
 @mcp.tool()
+def extract_structured(url: str, schema: str, focus: str = "", time_range: str = "") -> str:
+    """
+    Extract typed JSON from a video against a schema you provide. Gemini watches
+    the whole video and returns JSON validated against the schema.
+
+    schema: a preset name, a path to a .json schema file, or an inline JSON Schema
+    string. Built-in presets: cli_commands, final_config, step_sequence,
+    code_blocks, resources_mentioned, chapters, recipe.
+
+    Works regardless of the video's language — Gemini transcribes the narration and
+    reads on-screen text directly; no captions/transcript are required.
+
+    Requires GEMINI_API_KEY. Returns the validated `data` on success, or a
+    structured error ({"status": "invalid", ...}) if the model could not produce
+    schema-conforming output after one retry.
+
+    Optional:
+    - focus: narrow what to extract, e.g. "only the auth setup".
+    - time_range: "START-END" in seconds or MM:SS.
+    """
+    from screenscribe.structured_extractor import extract_structured as _extract, list_presets
+    try:
+        result = _extract(url, schema, focus=focus, time_range=time_range)
+    except ValueError as e:
+        return json.dumps({"status": "error", "message": str(e), "presets": list_presets()})
+    return json.dumps(result)
+
+
+@mcp.tool()
 def list_sessions() -> str:
     """
     List all videos that have been processed and are available to query.
@@ -479,7 +508,7 @@ def list_sessions() -> str:
     if not sessions:
         return json.dumps({
             "sessions": [],
-            "message": "No sessions yet. Run extract_video(url) to process a video.",
+            "message": "No sessions yet. Run extract_frames(url) to process a video.",
         })
     return json.dumps({"sessions": sessions})
 
